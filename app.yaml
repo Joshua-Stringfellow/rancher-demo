@@ -73,6 +73,8 @@ spec:
             secretKeyRef:
               name: db-credentials
               key: postgres-password
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
         volumeMounts:
         - name: postgres-storage
           mountPath: /var/lib/postgresql/data
@@ -83,6 +85,14 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - postgres
+          initialDelaySeconds: 10
+          periodSeconds: 5
   volumeClaimTemplates:
   - metadata:
       name: postgres-storage
@@ -127,7 +137,6 @@ spec:
         image: redis:7-alpine
         ports:
         - containerPort: 6379
-        command: ["redis-server"]
         args: ["--requirepass", "$(REDIS_PASSWORD)"]
         env:
         - name: REDIS_PASSWORD
@@ -142,6 +151,13 @@ spec:
           limits:
             memory: "256Mi"
             cpu: "200m"
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
 
 ---
 # Frontend Service
@@ -154,7 +170,7 @@ spec:
   type: LoadBalancer
   ports:
   - port: 80
-    targetPort: 8080
+    targetPort: 80
   selector:
     app: frontend
 
@@ -177,9 +193,9 @@ spec:
     spec:
       containers:
       - name: frontend
-        image: nginx:latest
+        image: nginx:alpine
         ports:
-        - containerPort: 8080
+        - containerPort: 80
         envFrom:
         - configMapRef:
             name: app-config
@@ -196,15 +212,64 @@ spec:
         livenessProbe:
           httpGet:
             path: /
-            port: 8080
+            port: 80
           initialDelaySeconds: 10
           periodSeconds: 10
         readinessProbe:
           httpGet:
             path: /
-            port: 8080
+            port: 80
           initialDelaySeconds: 5
           periodSeconds: 5
+
+---
+# API Gateway ConfigMap for nginx config
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-gateway-config
+  namespace: microservices-demo
+data:
+  nginx.conf: |
+    events {
+      worker_connections 1024;
+    }
+    http {
+      upstream order_service {
+        server order-service:8080;
+      }
+      upstream user_service {
+        server user-service:8080;
+      }
+      upstream product_service {
+        server product-service:8080;
+      }
+      server {
+        listen 8080;
+        
+        location /health {
+          return 200 "healthy\n";
+          add_header Content-Type text/plain;
+        }
+        
+        location /ready {
+          return 200 "ready\n";
+          add_header Content-Type text/plain;
+        }
+        
+        location /api/orders {
+          proxy_pass http://order_service;
+        }
+        
+        location /api/users {
+          proxy_pass http://user_service;
+        }
+        
+        location /api/products {
+          proxy_pass http://product_service;
+        }
+      }
+    }
 
 ---
 # API Gateway Service
@@ -245,13 +310,10 @@ spec:
         envFrom:
         - configMapRef:
             name: app-config
-        env:
-        - name: ORDER_SERVICE_URL
-          value: "http://order-service:8080"
-        - name: USER_SERVICE_URL
-          value: "http://user-service:8080"
-        - name: PRODUCT_SERVICE_URL
-          value: "http://product-service:8080"
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
         resources:
           requests:
             memory: "128Mi"
@@ -271,6 +333,43 @@ spec:
             port: 8080
           initialDelaySeconds: 10
           periodSeconds: 5
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: api-gateway-config
+
+---
+# Order Service ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-service-config
+  namespace: microservices-demo
+data:
+  nginx.conf: |
+    events {
+      worker_connections 1024;
+    }
+    http {
+      server {
+        listen 8080;
+        
+        location /health {
+          return 200 "order-service healthy\n";
+          add_header Content-Type text/plain;
+        }
+        
+        location /ready {
+          return 200 "order-service ready\n";
+          add_header Content-Type text/plain;
+        }
+        
+        location / {
+          return 200 "Order Service - Connected to PostgreSQL and Redis\n";
+          add_header Content-Type text/plain;
+        }
+      }
+    }
 
 ---
 # Order Service
@@ -328,6 +427,10 @@ spec:
             secretKeyRef:
               name: db-credentials
               key: redis-password
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
         resources:
           requests:
             memory: "256Mi"
@@ -347,6 +450,43 @@ spec:
             port: 8080
           initialDelaySeconds: 10
           periodSeconds: 5
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: order-service-config
+
+---
+# User Service ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-service-config
+  namespace: microservices-demo
+data:
+  nginx.conf: |
+    events {
+      worker_connections 1024;
+    }
+    http {
+      server {
+        listen 8080;
+        
+        location /health {
+          return 200 "user-service healthy\n";
+          add_header Content-Type text/plain;
+        }
+        
+        location /ready {
+          return 200 "user-service ready\n";
+          add_header Content-Type text/plain;
+        }
+        
+        location / {
+          return 200 "User Service - Connected to PostgreSQL\n";
+          add_header Content-Type text/plain;
+        }
+      }
+    }
 
 ---
 # User Service
@@ -395,6 +535,10 @@ spec:
             secretKeyRef:
               name: db-credentials
               key: postgres-password
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
         resources:
           requests:
             memory: "128Mi"
@@ -402,6 +546,55 @@ spec:
           limits:
             memory: "256Mi"
             cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: user-service-config
+
+---
+# Product Service ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: product-service-config
+  namespace: microservices-demo
+data:
+  nginx.conf: |
+    events {
+      worker_connections 1024;
+    }
+    http {
+      server {
+        listen 8080;
+        
+        location /health {
+          return 200 "product-service healthy\n";
+          add_header Content-Type text/plain;
+        }
+        
+        location /ready {
+          return 200 "product-service ready\n";
+          add_header Content-Type text/plain;
+        }
+        
+        location / {
+          return 200 "Product Service - Connected to Redis\n";
+          add_header Content-Type text/plain;
+        }
+      }
+    }
 
 ---
 # Product Service
@@ -450,6 +643,10 @@ spec:
             secretKeyRef:
               name: db-credentials
               key: redis-password
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
         resources:
           requests:
             memory: "128Mi"
@@ -457,6 +654,22 @@ spec:
           limits:
             memory: "256Mi"
             cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: product-service-config
 
 ---
 # Horizontal Pod Autoscaler for Order Service
@@ -517,3 +730,10 @@ spec:
     ports:
     - protocol: TCP
       port: 6379
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
